@@ -4,4 +4,4 @@ scikit-learn
 lightgbm
 torch
 sentence-transformers
-tqdm
+pyarrow
