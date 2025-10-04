@@ -1,28 +1,31 @@
 import os, sys, subprocess
 
+TEMPLATE_DIR = "/teamspace/uploads"
+
 if __name__ == "__main__":
-    print("Installing dependencies...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], check=True)
-    print("Dependencies installed\n")
+    os.environ["TEMPLATE_DIR"] = TEMPLATE_DIR
 
-    for d in ["output/data", "output/predictions", "output/portfolio"]:
-        os.makedirs(d, exist_ok=True)
+    subprocess.run([
+        sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"
+    ], check=True)
 
-    print("=== Pipeline: LightGBM + NLP Training ===\n")
+    os.makedirs("output/data", exist_ok=True)
+    os.makedirs("output/predictions", exist_ok=True)
+    os.makedirs("output/portfolio", exist_ok=True)
 
-    print("Step 1: Build lead-4 dataset")
-    #subprocess.run(["python", "lead_ratios.py"], check=True)
+    print("=== Step 1: Build lead-4 dataset ===")
+    subprocess.run([sys.executable, "lead_ratios.py"], check=True)
 
-    print("Step 2: NLP engine (text feature extraction)")
-    subprocess.run(["python", "nlp_engine.py"], check=True)
+    print("=== Step 2: Build reports (corporate filings) ===")
+    subprocess.run([sys.executable, "build_reports.py"], check=True)
 
-    print("Step 3: Train LightGBM + NLP fusion model")
-    subprocess.run(["python", "train_dualengine.py"], check=True)
+    print("=== Step 3: NLP engine (text feature extraction) ===")
+    subprocess.run([sys.executable, "nlp_engine.py"], check=True)
 
-    print("Step 4: Portfolio analysis")
-    subprocess.run(["python", "portfolio_analysis.py"], check=True)
+    print("=== Step 4: Train LightGBM + NLP fusion model ===")
+    subprocess.run([sys.executable, "train_dualengine.py"], check=True)
 
-    print("\nPipeline completed. Results are saved in /output/")
-    print("   ├── output/data/          (datasets)")
-    print("   ├── output/predictions/   (model predictions)")
-    print("   └── output/portfolio/     (portfolio analysis results)\n")
+    print("=== Step 5: Portfolio analysis ===")
+    subprocess.run([sys.executable, "portfolio_analysis.py"], check=True)
+
+    print("\nCompleted. Results are saved in /output/")
