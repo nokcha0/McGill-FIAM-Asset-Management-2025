@@ -4,22 +4,25 @@ Extract advanced text-based financial factors and merge into baseline dataset.
 Steps:
   1. Load baseline & reports
   2. Compute lexicon-based sentiment/risk features
-  3. Generate novelty score using embeddings
+  3. Generate novelty score using embeddings (GPU if available, with caching)
   4. Merge with baseline dataset
   5. Apply monthly z-scoring
 """
 
-import os, re, argparse
+import os, re, hashlib
 import numpy as np
 import pandas as pd
 from numpy.linalg import norm
 from sentence_transformers import SentenceTransformer
+import torch
+import pyarrow.parquet as pq
 
-BASELINE_FILE = "output/data/final_data.csv"
-OUT_FILE      = "output/data/final_data_text.csv"
+BASELINE_FILE = "output/data/final_data.parquet"
+REPORTS_FILE  = "output/data/reports.parquet"
+OUT_FILE      = "output/data/final_data_text.parquet"
 CACHE_DIR     = "output/cache"
+EMB_CACHE     = os.path.join(CACHE_DIR, "embeddings.parquet")
 
-# --- Lexicons ---
 POS = {"growth","improve","strength","robust","opportunity","profitable","innovation","expansion","efficiency","tailwind"}
 NEG = {"decline","weak","risk","headwind","loss","impairment","litigation","regulatory","supply","inflation","recession"}
 UNCERTAINTY = {"uncertain","volatility","approximately","could","may","might","pending","depends","risk of"}
@@ -47,7 +50,6 @@ INTENS_UP  = {"significant","substantial","strong"}
 INTENS_DN  = {"slight","modest","minor"}
 
 TOKEN_RE = re.compile(r"[a-z0-9\-]+")
-
 def tokenize(text): return TOKEN_RE.findall(str(text).lower())
 def gen_bigrams(tokens): return [f"{a} {b}" for a, b in zip(tokens[:-1], tokens[1:])]
 
@@ -65,30 +67,24 @@ def sentiment_with_logic(tokens):
     return pos, neg
 
 def per_k(val,length): return 1000.0*(val/max(length,1))
+def hash_row(row):
+    text = str(row.get("text","")) + str(row.get("id","")) + str(row.get("char_eom",""))
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--reports_csv", type=str, default=None)
-    ap.add_argument("--text_date_col", type=str, default="char_eom")
-    ap.add_argument("--use_gpu", action="store_true")
-    args = ap.parse_args()
-
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    print("[1/5] Loading baseline data")
-    base = pd.read_csv(BASELINE_FILE, parse_dates=["date","ret_eom"], low_memory=False)
+    print("[1/5] Loading baseline + reports")
+    schema_cols = set(pq.ParquetFile(BASELINE_FILE).schema.names)
+    keep_cols = [c for c in ["id","ret_eom","date","stock_ret"] if c in schema_cols] + [c for c in schema_cols if c.endswith("_lead4")]
+    base = pd.read_parquet(BASELINE_FILE, columns=keep_cols)
 
-    if not args.reports_csv or not os.path.exists(args.reports_csv):
-        base.to_csv(OUT_FILE, index=False)
-        print(f"    -> No reports found, baseline copied to {OUT_FILE}")
-        return
+    reports = pd.read_parquet(REPORTS_FILE)
+    reports["char_eom"] = pd.to_datetime(reports["char_eom"], errors="coerce")
 
-    print("[2/5] Loading reports and computing lexicon features")
-    txt = pd.read_csv(args.reports_csv, low_memory=False)
-    txt[args.text_date_col] = pd.to_datetime(txt[args.text_date_col], errors="coerce")
-
-    feats = []
-    for _,row in txt.iterrows():
+    print("[2/5] Computing lexicon features")
+    feats, hashes = [], []
+    for _,row in reports.iterrows():
         toks = tokenize(row.get("text",""))
         bigr = gen_bigrams(toks)
         L = len(toks)
@@ -116,29 +112,49 @@ def main():
             "hiring_k": per_k(sum(t in HIRING for t in toks+bigr),L)
         }
         feats.append(f)
+        hashes.append(hash_row(row))
 
     txt_feats = pd.DataFrame(feats)
+    reports["hash"] = hashes
 
-    print("[3/5] Computing embeddings for novelty score")
+    print("[3/5] Computing embeddings with caching")
     model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    if args.use_gpu:
-        try: model = model.to("cuda")
-        except: pass
-    txt = txt.sort_values(["id", args.text_date_col]).reset_index(drop=True)
-    embs = model.encode(txt["text"].astype(str).tolist(), show_progress_bar=True)
-    prev = txt.groupby("id").cumcount()-1
-    cos = np.zeros(len(txt))
-    for i in range(len(txt)):
+    if torch.cuda.is_available():
+        try:
+            model = model.to("cuda")
+            print("    -> Using GPU for embeddings")
+        except Exception as e:
+            print("    -> GPU fallback to CPU:", str(e))
+    else:
+        print("    -> No GPU detected, running on CPU")
+
+    if os.path.exists(EMB_CACHE):
+        cache_df = pd.read_parquet(EMB_CACHE)
+    else:
+        cache_df = pd.DataFrame(columns=["hash"]+[f"dim{i}" for i in range(384)])
+
+    cached_hashes = set(cache_df["hash"].tolist())
+    new_rows = reports[~reports["hash"].isin(cached_hashes)]
+
+    if not new_rows.empty:
+        new_embs = model.encode(new_rows["text"].astype(str).tolist(), show_progress_bar=True)
+        new_embs_df = pd.DataFrame(new_embs, columns=[f"dim{i}" for i in range(new_embs.shape[1])])
+        new_embs_df.insert(0, "hash", new_rows["hash"].values)
+        cache_df = pd.concat([cache_df, new_embs_df], ignore_index=True).drop_duplicates("hash")
+        cache_df.to_parquet(EMB_CACHE, index=False)
+
+    emb_dict = {row["hash"]: row[1:].values for _,row in cache_df.iterrows()}
+    embs = np.stack([emb_dict[h] for h in reports["hash"]])
+    prev = reports.groupby("id").cumcount()-1
+    cos = np.zeros(len(reports))
+    for i in range(len(reports)):
         if prev[i]>=0:
             cos[i]=(embs[i]@embs[prev[i]])/(norm(embs[i])*norm(embs[prev[i]]))
     txt_feats["novelty_score"] = 1.0-cos
 
     print("[4/5] Merging text features into baseline dataset")
-    if args.text_date_col=="char_eom":
-        txt["ret_eom"]=txt["char_eom"]+pd.DateOffset(months=4)
-    else:
-        txt["ret_eom"]=txt[args.text_date_col]
-    df = base.merge(pd.concat([txt[["id","ret_eom"]], txt_feats], axis=1),
+    reports["ret_eom"]=reports["char_eom"]+pd.DateOffset(months=4)
+    df = base.merge(pd.concat([reports[["id","ret_eom"]], txt_feats], axis=1),
                     on=["id","ret_eom"], how="left")
 
     print("[5/5] Applying monthly z-scoring and saving output")
@@ -149,8 +165,8 @@ def main():
     df = df.groupby("date", group_keys=False).apply(zfun).fillna(0)
 
     os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
-    df.to_csv(OUT_FILE, index=False)
+    df.to_parquet(OUT_FILE, index=False, compression="snappy")
     print(f"    -> [DONE] wrote {OUT_FILE} with shape {df.shape}")
 
-if __name__=="__main__": 
+if __name__=="__main__":
     main()
